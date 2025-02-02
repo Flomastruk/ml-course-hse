@@ -1,4 +1,3 @@
-version: '0'
 services:
   ml_sokolov:
     # image: python:3.12-bookworm

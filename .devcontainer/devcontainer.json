@@ -30,7 +30,12 @@
 				"ms-toolsai.jupyter-keymap",
 				"ms-toolsai.jupyter-renderers",
 				"mathematic.vscode-pdf",
-			]
+			],
+			"settings": {
+				// editor.formatOnSave doesn't work but it's the recommended way of adding settings generally
+				//  https://code.visualstudio.com/docs/devcontainers/containers#_container-specific-settings
+				"editor.formatOnSave": true,
+			}
 		}
 	},
 
