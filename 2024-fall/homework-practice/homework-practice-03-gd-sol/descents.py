@@ -109,7 +109,7 @@ class VanillaGradientDescent(BaseDescent):
     def calc_gradient(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         if self.loss_function != LossFunction.MSE:
             raise NotImplementedError("Need to implement loss function")
-        return x.T.dot(x.dot(self.w) - y) / len(y)
+        return 2 * x.T.dot(x.dot(self.w) - y) / len(y)
 
 
 class StochasticDescent(VanillaGradientDescent):
