@@ -93,7 +93,7 @@ class DecisionTree:
         ):
             raise ValueError("There is unknown feature type")
 
-        self._tree = {}
+        self.tree_ = {}
         self._feature_types = feature_types
         self._max_depth = max_depth
         self._min_samples_split = min_samples_split if min_samples_split else 1
@@ -149,7 +149,9 @@ class DecisionTree:
 
         if feature_best is None:
             node["type"] = "terminal"
-            node["class"] = round(sub_y.median())
+            node["class"] = (
+                sub_y.median() if sub_y.dtype.is_numeric() else sub_y.mode().first()
+            )
             return
 
         node["type"] = "nonterminal"
@@ -174,7 +176,7 @@ class DecisionTree:
             return 99  # dummy
         return x.select(
             pred=pl.when(node["type"] == "terminal")
-            .then(node["class"] if node["type"] == "terminal" else 99)
+            .then(pl.lit(node["class"]) if node["type"] == "terminal" else 99)
             .when(
                 False
                 if node["type"] == "terminal"
@@ -197,10 +199,10 @@ class DecisionTree:
         )["pred"]
 
     def fit(self, X, y):
-        self._fit_node(X, y, self._tree)
+        self._fit_node(X, y, self.tree_)
 
     def predict(self, X):
-        return self._predict_node(X, self._tree)
+        return self._predict_node(X, self.tree_)
 
 
 class LinearRegressionTree:
