@@ -3,6 +3,8 @@ from collections import Counter
 import numpy as np
 import polars as pl
 
+from typing import Callable, Union
+
 
 def find_best_split(feature_vector: pl.Series, target_vector: pl.Series):
     """
@@ -205,6 +207,134 @@ class DecisionTree:
         return self._predict_node(X, self.tree_)
 
 
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+
+def find_best_split_linreg(
+    feature_splits: pl.Series,
+    feature_vector: pl.Series,
+    target_vector: pl.Series,
+    loss_func: Callable = mean_squared_error,
+):
+    """
+    :return thresholds: отсортированный по возрастанию вектор со всеми возможными порогами, по которым объекты можно
+     разделить на две различные подвыборки, или поддерева
+    :return losses: вектор со значениями для каждого из порогов в thresholds len(ginis) == len(thresholds)
+    :return threshold_best: оптимальный порог (число)
+    :return losses_best: оптимальное значение (число)
+    """
+    assert len(feature_vector) == len(target_vector), "Inputs must have equal lengths"
+    if 0 == len(feature_vector):
+        return pl.Series([], dtype=float), pl.Series([], dtype=float), None, None
+
+    splits = (
+        pl.DataFrame({"s": feature_splits, "f": feature_vector, "v": target_vector})
+        .group_by(pl.col("s"))
+        .agg(fs=pl.col("f"), vs=pl.col("v"))
+        .sort("s")
+        .with_row_index("ix", 1)
+        .select(pl.col("ix", "s"), pl.col("fs").implode(), pl.col("vs").implode())[:-1]
+        .select(
+            pl.col("ix", "s"),
+            left_fs=pl.col("fs").list.head(pl.col("ix")),
+            left_vs=pl.col("vs").list.head(pl.col("ix")),
+            right_fs=pl.col("fs").list.slice(pl.col("ix"), None),
+            right_vs=pl.col("vs").list.slice(pl.col("ix"), None),
+        )
+        .with_columns(
+            pl.col("left_fs", "left_vs", "right_fs", "right_vs").list.eval(
+                pl.element().explode()
+            )
+        )
+    )
+    left_splits = (
+        (
+            splits.explode(columns=["left_fs", "left_vs"])
+            .with_columns(
+                b=pl.cov("left_fs", "left_vs").truediv(pl.var("left_fs")).over("ix"),
+            )
+            .with_columns(
+                a=pl.col("left_vs").sub(pl.col("b").mul("left_fs")).mean().over("ix")
+            )
+        )
+        .group_by("ix")
+        .agg(
+            n_left=pl.len(),
+            mse_left=pl.col("left_vs")
+            .sub(pl.col("a") + pl.col("b").mul("left_fs"))
+            .pow(2)
+            .mean(),
+        )
+    )
+
+    right_splits = (
+        (
+            splits.explode(columns=["right_fs", "right_vs"])
+            .with_columns(
+                b=pl.cov("right_fs", "right_vs").truediv(pl.var("right_fs")).over("ix"),
+            )
+            .with_columns(
+                a=pl.col("right_vs").sub(pl.col("b").mul("right_fs")).mean().over("ix")
+            )
+        )
+        .group_by("ix")
+        .agg(
+            n_right=pl.len(),
+            mse_right=pl.col("right_vs")
+            .sub(pl.col("a") + pl.col("b").mul("right_fs"))
+            .pow(2)
+            .mean(),
+        )
+    )
+    res = (
+        left_splits.join(right_splits, on="ix")
+        .with_columns(
+            mse=(
+                pl.col("n_left").mul("mse_left") + pl.col("n_right").mul("mse_right")
+            ).truediv(pl.col("n_left").add(pl.col("n_right")))
+        )
+        .join(splits.select("ix", "s"), on="ix")
+    )
+    best_ix = res["mse"].arg_min()
+
+    return res["s"], res["mse"], res[best_ix, "s"], res[best_ix, "mse"]
+
+    #     .pivot(
+    #         on="v",
+    #         index="f",
+    #         values="count",
+    #     )
+    #     .with_columns(
+    #         pl.exclude("f").fill_null(0),
+    #     )
+    #     .select(
+    #         (0.5 * (pl.col("f") + pl.col("f").shift(-1))).alias("threshold"),
+    #         pl.exclude("f").cum_sum().name.prefix("left_"),
+    #         (pl.exclude("f").sum() - pl.exclude("f").cum_sum()).name.prefix("right_"),
+    #     )[:-1]
+    #     .with_columns(
+    #         pl.sum_horizontal(sel_left).alias("total_left"),
+    #         pl.sum_horizontal(sel_right).alias("total_right"),
+    #     )
+    #     .with_columns(
+    #         h_l=1.0 - pl.sum_horizontal(sel_left.truediv("total_left").pow(2)),
+    #         h_r=1.0 - pl.sum_horizontal(sel_right.truediv("total_right").pow(2)),
+    #     )
+    #     .select(
+    #         pl.col("threshold"),
+    #         q=(pl.col("h_l").mul("total_left") + pl.col("h_r").mul("total_right"))
+    #         .truediv(pl.col("total_left") + pl.col("total_right"))
+    #         .neg(),
+    #     )
+    # )
+    # # .with_columns( # doesn't work as expected
+    # #     (sel_right - sel_left)
+    # # )
+    # best_ix = res["q"].arg_max()
+
+    # return res["threshold"], res["q"], res[best_ix, "threshold"], res[best_ix, "q"]
+
+
 class LinearRegressionTree:
     def __init__(
         self,
@@ -215,3 +345,21 @@ class LinearRegressionTree:
         min_samples_leaf=None,
     ):
         pass
+
+
+# class DecisionTree:
+#     def __init__(
+#         self,
+#         feature_types,
+#         max_depth=None,
+#         min_samples_split=None,
+#         min_samples_leaf=None,
+#     ):
+#         if np.any(
+#             list(
+#                 map(
+#                     lambda x: (x != "real") and (x != "categorical"),
+#                     feature_types.values(),
+#                 )
+#             )
+#         ):
