@@ -95,20 +95,23 @@ class DecisionTree:
         ):
             raise ValueError("There is unknown feature type")
 
-        self.tree_ = {}
         self._feature_types = feature_types
+        self.tree_ = {"depth": 0}
         self._max_depth = max_depth
-        self._min_samples_split = min_samples_split if min_samples_split else 1
+        self._min_samples_split = min_samples_split if min_samples_split else 2
         self._min_samples_leaf = min_samples_leaf if min_samples_leaf else 1
 
     def _fit_node(self, sub_X, sub_y, node):
         is_terminal = False
+        is_terminal |= node["depth"] >= self._max_depth
         is_terminal |= (sub_y == sub_y[0]).all()
-        is_terminal |= self._min_samples_split >= len(sub_y)
+        is_terminal |= self._min_samples_split > len(sub_y)
 
         if is_terminal:
             node["type"] = "terminal"
-            node["class"] = sub_y[0]
+            node["class"] = (
+                sub_y.median() if sub_y.dtype.is_numeric() else sub_y.mode().first()
+            )
             return
 
         feature_best, threshold_best, gini_best, split = None, None, None, None
@@ -165,7 +168,9 @@ class DecisionTree:
             node["categories_split"] = threshold_best
         else:
             raise ValueError
-        node["left_child"], node["right_child"] = {}, {}
+        node["left_child"], node["right_child"] = {"depth": node["depth"] + 1}, {
+            "depth": node["depth"] + 1
+        }
         self._fit_node(sub_X.filter(split), sub_y.filter(split), node["left_child"])
         self._fit_node(
             sub_X.filter(split.not_()),
@@ -183,7 +188,7 @@ class DecisionTree:
                 False
                 if node["type"] == "terminal"
                 else (
-                    pl.col(node["feature_split"]) < node["threshold"]
+                    pl.col(node["feature_split"]) <= node["threshold"]
                     if self._feature_types[node["feature_split"]] == "real"
                     else pl.col(node["feature_split"]).is_in(node["categories_split"])
                 )
@@ -202,19 +207,16 @@ class DecisionTree:
 
     def fit(self, X, y):
         self._fit_node(X, y, self.tree_)
+        return self
 
     def predict(self, X):
         return self._predict_node(X, self.tree_)
-
-
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 
 def find_best_split_linreg(
     feature_splits: pl.Series,
     feature_vector: pl.Series,
     target_vector: pl.Series,
-    loss_func: Callable = mean_squared_error,
 ):
     """
     :return thresholds: отсортированный по возрастанию вектор со всеми возможными порогами, по которым объекты можно
@@ -224,8 +226,10 @@ def find_best_split_linreg(
     :return losses_best: оптимальное значение (число)
     """
     assert len(feature_vector) == len(target_vector), "Inputs must have equal lengths"
-    if 0 == len(feature_vector):
+    assert len(feature_splits) == len(target_vector), "Inputs must have equal lengths"
+    if 0 == len(feature_splits):
         return pl.Series([], dtype=float), pl.Series([], dtype=float), None, None
+    assert feature_splits.n_unique() > 1, "This function mustn't be called this way"
 
     splits = (
         pl.DataFrame({"s": feature_splits, "f": feature_vector, "v": target_vector})
@@ -251,7 +255,13 @@ def find_best_split_linreg(
         (
             splits.explode(columns=["left_fs", "left_vs"])
             .with_columns(
-                b=pl.cov("left_fs", "left_vs").truediv(pl.var("left_fs")).over("ix"),
+                xy=pl.cov("left_fs", "left_vs").over("ix"),
+                xx=pl.var("left_fs").over("ix"),
+            )
+            .with_columns(
+                b=pl.when(pl.col("xx") == 0)
+                .then(0)
+                .otherwise(pl.col("xy").truediv("xx"))
             )
             .with_columns(
                 a=pl.col("left_vs").sub(pl.col("b").mul("left_fs")).mean().over("ix")
@@ -259,8 +269,9 @@ def find_best_split_linreg(
         )
         .group_by("ix")
         .agg(
+            max_f_left=pl.col("left_fs").max(),
             n_left=pl.len(),
-            mse_left=pl.col("left_vs")
+            loss_left=pl.col("left_vs")
             .sub(pl.col("a") + pl.col("b").mul("left_fs"))
             .pow(2)
             .mean(),
@@ -271,7 +282,13 @@ def find_best_split_linreg(
         (
             splits.explode(columns=["right_fs", "right_vs"])
             .with_columns(
-                b=pl.cov("right_fs", "right_vs").truediv(pl.var("right_fs")).over("ix"),
+                xy=pl.cov("right_fs", "right_vs").over("ix"),
+                xx=pl.var("right_fs").over("ix"),
+            )
+            .with_columns(
+                b=pl.when(pl.col("xx") == 0)
+                .then(0)
+                .otherwise(pl.col("xy").truediv("xx"))
             )
             .with_columns(
                 a=pl.col("right_vs").sub(pl.col("b").mul("right_fs")).mean().over("ix")
@@ -279,87 +296,139 @@ def find_best_split_linreg(
         )
         .group_by("ix")
         .agg(
+            min_f_right=pl.col("right_fs").min(),
             n_right=pl.len(),
-            mse_right=pl.col("right_vs")
+            loss_right=pl.col("right_vs")
             .sub(pl.col("a") + pl.col("b").mul("right_fs"))
             .pow(2)
             .mean(),
         )
     )
-    res = (
-        left_splits.join(right_splits, on="ix")
-        .with_columns(
-            mse=(
-                pl.col("n_left").mul("mse_left") + pl.col("n_right").mul("mse_right")
-            ).truediv(pl.col("n_left").add(pl.col("n_right")))
-        )
-        .join(splits.select("ix", "s"), on="ix")
+    res = left_splits.join(right_splits, on="ix").with_columns(
+        threshold=pl.col("max_f_left").add(pl.col("min_f_right")).mul(0.5),
+        loss=(
+            pl.col("n_left").mul("loss_left") + pl.col("n_right").mul("loss_right")
+        ).truediv(pl.col("n_left").add(pl.col("n_right"))),
     )
-    best_ix = res["mse"].arg_min()
+    best_ix = res["loss"].arg_min()
 
-    return res["s"], res["mse"], res[best_ix, "s"], res[best_ix, "mse"]
-
-    #     .pivot(
-    #         on="v",
-    #         index="f",
-    #         values="count",
-    #     )
-    #     .with_columns(
-    #         pl.exclude("f").fill_null(0),
-    #     )
-    #     .select(
-    #         (0.5 * (pl.col("f") + pl.col("f").shift(-1))).alias("threshold"),
-    #         pl.exclude("f").cum_sum().name.prefix("left_"),
-    #         (pl.exclude("f").sum() - pl.exclude("f").cum_sum()).name.prefix("right_"),
-    #     )[:-1]
-    #     .with_columns(
-    #         pl.sum_horizontal(sel_left).alias("total_left"),
-    #         pl.sum_horizontal(sel_right).alias("total_right"),
-    #     )
-    #     .with_columns(
-    #         h_l=1.0 - pl.sum_horizontal(sel_left.truediv("total_left").pow(2)),
-    #         h_r=1.0 - pl.sum_horizontal(sel_right.truediv("total_right").pow(2)),
-    #     )
-    #     .select(
-    #         pl.col("threshold"),
-    #         q=(pl.col("h_l").mul("total_left") + pl.col("h_r").mul("total_right"))
-    #         .truediv(pl.col("total_left") + pl.col("total_right"))
-    #         .neg(),
-    #     )
-    # )
-    # # .with_columns( # doesn't work as expected
-    # #     (sel_right - sel_left)
-    # # )
-    # best_ix = res["q"].arg_max()
-
-    # return res["threshold"], res["q"], res[best_ix, "threshold"], res[best_ix, "q"]
+    return (
+        res["threshold"],
+        res["loss"],
+        res[best_ix, "threshold"],
+        res[best_ix, "loss"],
+    )
 
 
-class LinearRegressionTree:
+class LinearRegressionTree(DecisionTree):
     def __init__(
         self,
-        feature_types,
-        base_model_type=None,
+        # base_model_type=None, # EA: will only implement MSE
         max_depth=None,
         min_samples_split=None,
         min_samples_leaf=None,
+        n_split_quantiles=None,
     ):
-        pass
+        super().__init__({}, max_depth, min_samples_split, min_samples_leaf)
+        self._n_split_quantiles = n_split_quantiles
 
+    def _fit_node(self, sub_X, sub_y, node: dict):
+        is_terminal = False
+        is_terminal |= node["depth"] >= self._max_depth
+        is_terminal |= sub_y.n_unique() == 1
+        is_terminal |= self._min_samples_split > len(sub_y)
 
-# class DecisionTree:
-#     def __init__(
-#         self,
-#         feature_types,
-#         max_depth=None,
-#         min_samples_split=None,
-#         min_samples_leaf=None,
-#     ):
-#         if np.any(
-#             list(
-#                 map(
-#                     lambda x: (x != "real") and (x != "categorical"),
-#                     feature_types.values(),
-#                 )
-#             )
-#         ):
+        feature_best, threshold_best, loss_best, split = (
+            None,
+            None,
+            None,
+            None,
+        )
+        for feature in [] if is_terminal else sub_X.columns:
+            feature_vector = sub_X[feature]
+            if self._n_split_quantiles is not None:
+                feature_splits = (
+                    (feature_vector.rank("dense") - 1)
+                    / feature_vector.n_unique()
+                    * self._n_split_quantiles
+                ).floor()
+            else:
+                feature_splits = feature_vector
+
+            if feature_splits.n_unique() <= 1:
+                continue
+            _, _, threshold, _loss = find_best_split_linreg(
+                feature_splits, feature_vector, sub_y
+            )
+            if loss_best is None or _loss < loss_best:
+                split = feature_vector <= threshold
+                if self._min_samples_split and sum(split) < self._min_samples_leaf:
+                    # EA technically need to run through all thresholds but we will skip feature in this setting
+                    continue
+                loss_best = _loss
+                feature_best = feature
+                threshold_best = threshold
+                assert (
+                    threshold_best is not None
+                ), "This never happens since feature_splits.n_unique >= 1"
+
+        if feature_best is None:
+            loss_best, a_best, b_best = None, None, None
+            for feature in sub_X.columns:
+                feature_vector = sub_X[feature]
+                v = feature_vector.var()
+                if v == 0:
+                    a = sub_y.mean()
+                    b = 0.0
+                else:
+                    b = pl.cov(feature_vector, sub_y, eager=True).item() / v
+                    a = (sub_y - b * feature_vector).mean()
+                _loss = (sub_y - a - b * feature_vector).pow(2).mean()
+                if loss_best is None or _loss < loss_best:
+                    feature_best = feature
+                    feature_best, a_best, b_best = feature, a, b
+            node["type"] = "terminal"
+            node["covariate_name"] = feature
+            node["a"] = a_best
+            node["b"] = b_best
+            return
+
+        node["type"] = "nonterminal"
+        node["feature_split"] = feature_best
+        node["threshold"] = threshold_best
+        node["left_child"], node["right_child"] = {"depth": node["depth"] + 1}, {
+            "depth": node["depth"] + 1
+        }
+        self._fit_node(sub_X.filter(split), sub_y.filter(split), node["left_child"])
+        self._fit_node(
+            sub_X.filter(split.not_()),
+            sub_y.filter(split.not_()),
+            node["right_child"],
+        )
+
+    def _predict_node(self, x, node):
+        if node is None:
+            return 99  # dummy
+        return x.select(
+            pred=pl.when(node["type"] == "terminal")
+            .then(
+                pl.col(node["covariate_name"]).mul(node["b"]).add(node["a"])
+                if node["type"] == "terminal"
+                else 99
+            )
+            .when(
+                False
+                if node["type"] == "terminal"
+                else pl.col(node["feature_split"]) <= node["threshold"]
+            )
+            .then(
+                self._predict_node(x, node["left_child"])
+                if node["type"] == "nonterminal"
+                else pl.repeat(99, pl.len())
+            )
+            .otherwise(
+                self._predict_node(x, node["right_child"])
+                if node["type"] == "nonterminal"
+                else pl.repeat(99, pl.len())
+            )
+        )["pred"]
