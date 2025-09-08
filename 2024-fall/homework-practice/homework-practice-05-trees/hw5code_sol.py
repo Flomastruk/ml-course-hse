@@ -1,9 +1,7 @@
-from collections import Counter
-
 import numpy as np
 import polars as pl
 
-from typing import Callable, Union
+from sklearn.base import BaseEstimator
 
 
 def find_best_split(feature_vector: pl.Series, target_vector: pl.Series):
@@ -253,14 +251,15 @@ def find_best_split_linreg(
     )
     left_splits = (
         (
-            splits.explode(columns=["left_fs", "left_vs"])
+            splits.select(pl.exclude("right_fs", "right_vs"))
+            .explode(columns=["left_fs", "left_vs"])
             .with_columns(
-                xy=pl.cov("left_fs", "left_vs").over("ix"),
-                xx=pl.var("left_fs").over("ix"),
+                xy=pl.cov("left_fs", "left_vs").over("ix").fill_null(0.0),
+                xx=pl.var("left_fs").over("ix").fill_null(0.0),
             )
             .with_columns(
-                b=pl.when(pl.col("xx") == 0)
-                .then(0)
+                b=pl.when(pl.col("xx") == 0.0)
+                .then(0.0)
                 .otherwise(pl.col("xy").truediv("xx"))
             )
             .with_columns(
@@ -280,14 +279,15 @@ def find_best_split_linreg(
 
     right_splits = (
         (
-            splits.explode(columns=["right_fs", "right_vs"])
+            splits.select(pl.exclude("left_fs", "left_vs"))
+            .explode(columns=["right_fs", "right_vs"])
             .with_columns(
-                xy=pl.cov("right_fs", "right_vs").over("ix"),
-                xx=pl.var("right_fs").over("ix"),
+                xy=pl.cov("right_fs", "right_vs").over("ix").fill_null(0.0),
+                xx=pl.var("right_fs").over("ix").fill_null(0.0),
             )
             .with_columns(
-                b=pl.when(pl.col("xx") == 0)
-                .then(0)
+                b=pl.when(pl.col("xx") == 0.0)
+                .then(0.0)
                 .otherwise(pl.col("xy").truediv("xx"))
             )
             .with_columns(
@@ -320,23 +320,26 @@ def find_best_split_linreg(
     )
 
 
-class LinearRegressionTree(DecisionTree):
+class LinearRegressionTree(BaseEstimator):
     def __init__(
         self,
         # base_model_type=None, # EA: will only implement MSE
         max_depth=None,
-        min_samples_split=None,
-        min_samples_leaf=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
         n_split_quantiles=None,
     ):
-        super().__init__({}, max_depth, min_samples_split, min_samples_leaf)
-        self._n_split_quantiles = n_split_quantiles
+        self.tree_ = {"depth": 0}
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.n_split_quantiles = n_split_quantiles
 
     def _fit_node(self, sub_X, sub_y, node: dict):
         is_terminal = False
-        is_terminal |= node["depth"] >= self._max_depth
+        is_terminal |= node["depth"] >= self.max_depth
         is_terminal |= sub_y.n_unique() == 1
-        is_terminal |= self._min_samples_split > len(sub_y)
+        is_terminal |= self.min_samples_split > len(sub_y)
 
         feature_best, threshold_best, loss_best, split = (
             None,
@@ -346,11 +349,11 @@ class LinearRegressionTree(DecisionTree):
         )
         for feature in [] if is_terminal else sub_X.columns:
             feature_vector = sub_X[feature]
-            if self._n_split_quantiles is not None:
+            if self.n_split_quantiles is not None:
                 feature_splits = (
                     (feature_vector.rank("dense") - 1)
                     / feature_vector.n_unique()
-                    * self._n_split_quantiles
+                    * self.n_split_quantiles
                 ).floor()
             else:
                 feature_splits = feature_vector
@@ -362,7 +365,7 @@ class LinearRegressionTree(DecisionTree):
             )
             if loss_best is None or _loss < loss_best:
                 split = feature_vector <= threshold
-                if self._min_samples_split and sum(split) < self._min_samples_leaf:
+                if self.min_samples_split and sum(split) < self.min_samples_leaf:
                     # EA technically need to run through all thresholds but we will skip feature in this setting
                     continue
                 loss_best = _loss
@@ -377,7 +380,7 @@ class LinearRegressionTree(DecisionTree):
             for feature in sub_X.columns:
                 feature_vector = sub_X[feature]
                 v = feature_vector.var()
-                if v == 0:
+                if v == 0.0 or v is None:
                     a = sub_y.mean()
                     b = 0.0
                 else:
@@ -385,10 +388,10 @@ class LinearRegressionTree(DecisionTree):
                     a = (sub_y - b * feature_vector).mean()
                 _loss = (sub_y - a - b * feature_vector).pow(2).mean()
                 if loss_best is None or _loss < loss_best:
-                    feature_best = feature
+                    loss_best = _loss
                     feature_best, a_best, b_best = feature, a, b
             node["type"] = "terminal"
-            node["covariate_name"] = feature
+            node["covariate_name"] = feature_best
             node["a"] = a_best
             node["b"] = b_best
             return
@@ -432,3 +435,10 @@ class LinearRegressionTree(DecisionTree):
                 else pl.repeat(99, pl.len())
             )
         )["pred"]
+
+    def fit(self, X, y):
+        self._fit_node(X, y, self.tree_)
+        return self
+
+    def predict(self, X):
+        return self._predict_node(X, self.tree_)
