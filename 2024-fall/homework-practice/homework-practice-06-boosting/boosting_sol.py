@@ -41,27 +41,25 @@ class Boosting:
         self.base_model_params: dict = (
             {} if base_model_params is None else base_model_params
         )
-
         self.n_estimators: int = n_estimators
-
-        self.models: list = []
-        self.gammas: list = []
-        self.train_logits: list = []
-
         self.learning_rate: float = learning_rate
         self.early_stopping_rounds = early_stopping_rounds
-
-        self.history = defaultdict(list)  # {"train_roc_auc": [], "train_loss": [], ...}
 
         self.sigmoid = lambda x: 1 / (1 + np.exp(-x))
         self.loss_fn = lambda y, z: -np.log(self.sigmoid(y * z)).mean()
         self.loss_derivative = lambda y, z: -y / (1 + np.exp(y * z))
 
+        self.history = defaultdict(list)  # {"train_roc_auc": [], "train_loss": [], ...}
+        self.models: list = []
+        self.gammas: list = []
+
+        self.train_logits: Optional[list] = []
+
     def partial_fit(self, X, y):
         # y_hat = self.predict_logit(X)
         y_hat = (
-            self.train_logits[-1]
-            if len(self.train_logits)
+            self.train_logits
+            if self.train_logits is not None
             else np.zeros(y.shape[0], dtype=float)
         )
         s = -self.loss_derivative(y, y_hat)
@@ -71,11 +69,12 @@ class Boosting:
         gamma = self.find_optimal_gamma(y, y_hat, s_hat)
         self.models.append(model)
         self.gammas.append(gamma)
-        self.train_logits.append(y_hat + self.learning_rate * gamma * s_hat)
+        self.train_logits = y_hat + self.learning_rate * gamma * s_hat
 
     def reset(self):
         self.models: list = []
         self.gammas: list = []
+        self.train_logits = None
 
     def fit(
         self,
@@ -92,15 +91,14 @@ class Boosting:
         :param y_val: targets array (eval set)
         :param plot: bool
         """
-        self.reset()
+        self.reset()  # EA?
         for _ in range(self.n_estimators):
+            # print("hello")
             self.partial_fit(X_train, y_train)
             self.history["train_roc_auc"].append(
-                roc_auc_score(y_train == 1, self.sigmoid(self.train_logits[-1]))
+                roc_auc_score(y_train == 1, self.sigmoid(self.train_logits))
             )
-            self.history["train_loss"].append(
-                self.loss_fn(y_train, self.train_logits[-1])
-            )
+            self.history["train_loss"].append(self.loss_fn(y_train, self.train_logits))
             if X_val is not None and y_val is not None:
                 val_logit = self.predict_logit(X_val)
                 self.history["val_roc_auc"].append(
@@ -110,7 +108,15 @@ class Boosting:
                 if self.early_stopping_rounds and self.early_stopping_rounds < len(
                     vh := self.history["val_loss"]
                 ):
-                    if all([hp <= hn for hp, hn in zip(vh[:-1], vh[1:])]):
+                    if all(
+                        [
+                            hp <= hn
+                            for hp, hn in zip(
+                                vh[-(self.early_stopping_rounds + 1) : -1],
+                                vh[-self.early_stopping_rounds :],
+                            )
+                        ]
+                    ):
                         break
         if plot:
             self.plot_history(X_val, y_val)
