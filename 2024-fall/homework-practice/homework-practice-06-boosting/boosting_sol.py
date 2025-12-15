@@ -36,6 +36,9 @@ class Boosting:
         n_estimators: int = 10,
         learning_rate: float = 0.1,
         early_stopping_rounds: Optional[int] = None,
+        bootstrap_type: Optional[str] = None,
+        subsample: float = 1.0,
+        bagging_temperature: Optional[float] = 0.0,
     ):
         self.base_model_class = base_model_class
         self.base_model_params: dict = (
@@ -44,6 +47,11 @@ class Boosting:
         self.n_estimators: int = n_estimators
         self.learning_rate: float = learning_rate
         self.early_stopping_rounds = early_stopping_rounds
+        if bootstrap_type is not None:
+            assert bootstrap_type in ["Bernoulli"]
+        self.bootstrap_type = bootstrap_type
+        self.subsample = subsample
+        self.bagging_temperature = bagging_temperature
 
         self.sigmoid = lambda x: 1 / (1 + np.exp(-x))
         self.loss_fn = lambda y, z: -np.log(self.sigmoid(y * z)).mean()
@@ -55,6 +63,14 @@ class Boosting:
 
         self.train_logits: Optional[list] = []
 
+    def get_subsample(self, X, y, y_hat):
+        if self.bootstrap_type is None:
+            return X, y, y_hat, None
+        l = X.shape[0]
+        assert l == y.shape[0] and l == y_hat.shape[0]
+        inds = np.random.choice(range(l), max(1, int(l * self.subsample), False))
+        return X[inds], y[inds], y_hat[inds], inds
+
     def partial_fit(self, X, y):
         # y_hat = self.predict_logit(X)
         y_hat = (
@@ -62,11 +78,22 @@ class Boosting:
             if self.train_logits is not None
             else np.zeros(y.shape[0], dtype=float)
         )
-        s = -self.loss_derivative(y, y_hat)
+        X_, y_, y_hat_, inds = self.get_subsample(X, y, y_hat)
+
+        s_ = -self.loss_derivative(y_, y_hat_)
         model = self.base_model_class(**self.base_model_params)
-        model.fit(X, s)
+        if self.bagging_temperature == 0.0:
+            model.fit(X_, s_)
+        else:
+            w_ = -np.log(np.random.uniform(size=X_.shape[0]))
+            if self.bagging_temperature != 1.0:
+                w_ = np.power(w_, self.bagging_temperature)
+            model.fit(X_, s_, sample_weight=w_)
+        # full set
         s_hat = model.predict(X)
-        gamma = self.find_optimal_gamma(y, y_hat, s_hat)
+        s_hat_ = s_hat if inds is None else s_hat[inds]
+
+        gamma = self.find_optimal_gamma(y_, y_hat_, s_hat_)
         self.models.append(model)
         self.gammas.append(gamma)
         self.train_logits = y_hat + self.learning_rate * gamma * s_hat
@@ -93,7 +120,6 @@ class Boosting:
         """
         self.reset()  # EA?
         for _ in range(self.n_estimators):
-            # print("hello")
             self.partial_fit(X_train, y_train)
             self.history["train_roc_auc"].append(
                 roc_auc_score(y_train == 1, self.sigmoid(self.train_logits))
