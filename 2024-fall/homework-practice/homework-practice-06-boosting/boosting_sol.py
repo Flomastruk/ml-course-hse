@@ -4,7 +4,6 @@ from collections import defaultdict
 
 import numpy as np
 import plotly.express as px
-import plotly.graph_objects as go
 import polars as pl
 
 from plotly.subplots import make_subplots
@@ -33,12 +32,13 @@ class Boosting:
         self,
         base_model_class=DecisionTreeRegressor,
         base_model_params: Optional[dict] = None,
-        n_estimators: int = 10,
+        n_estimators: Optional[int] = 10,
         learning_rate: float = 0.1,
         early_stopping_rounds: Optional[int] = None,
         bootstrap_type: Optional[str] = None,
         subsample: float = 1.0,
         bagging_temperature: Optional[float] = 0.0,
+        goss_k: Optional[float] = False,
     ):
         self.base_model_class = base_model_class
         self.base_model_params: dict = (
@@ -48,10 +48,11 @@ class Boosting:
         self.learning_rate: float = learning_rate
         self.early_stopping_rounds = early_stopping_rounds
         if bootstrap_type is not None:
-            assert bootstrap_type in ["Bernoulli"]
+            assert bootstrap_type in ["Bernoulli", "MVS"]
         self.bootstrap_type = bootstrap_type
         self.subsample = subsample
         self.bagging_temperature = bagging_temperature
+        self.goss_k = goss_k
 
         self.sigmoid = lambda x: 1 / (1 + np.exp(-x))
         self.loss_fn = lambda y, z: -np.log(self.sigmoid(y * z)).mean()
@@ -61,15 +62,44 @@ class Boosting:
         self.models: list = []
         self.gammas: list = []
 
-        self.train_logits: Optional[list] = []
+        self.train_logits: Optional[np.ndarray] = None
 
     def get_subsample(self, X, y, y_hat):
         if self.bootstrap_type is None:
-            return X, y, y_hat, None
+            return X, y, y_hat, None, -self.loss_derivative(y, y_hat), None
+
         l = X.shape[0]
         assert l == y.shape[0] and l == y_hat.shape[0]
-        inds = np.random.choice(range(l), max(1, int(l * self.subsample), False))
-        return X[inds], y[inds], y_hat[inds], inds
+
+        if self.goss_k is not None:
+            s = -self.loss_derivative(y, y_hat)
+            top_k = int(l * self.goss_k)
+            other = int(l * self.subsample)
+
+            inds = np.argpartition(np.abs(-s), top_k)
+            inds = np.concatenate(
+                [
+                    inds[:top_k],
+                    np.random.choice(
+                        inds[top_k:],
+                        size=other,
+                        replace=False,
+                    ),
+                ]
+            )
+            w_ = np.concatenate(
+                [
+                    np.repeat(1.0, top_k),
+                    np.repeat((1.0 - self.goss_k) / self.subsample, other),
+                ]
+            )
+            return X[inds], y[inds], y_hat[inds], w_, s[inds], inds
+        else:
+            inds = np.random.choice(range(l), max(1, int(l * self.subsample), False))
+            y_ = y[inds]
+            y_hat_ = y_hat[inds]
+            s_ = -self.loss_derivative(y_, y_hat_)
+            return X[inds], y_, y_hat_, None, s_, inds
 
     def partial_fit(self, X, y):
         # y_hat = self.predict_logit(X)
@@ -78,12 +108,11 @@ class Boosting:
             if self.train_logits is not None
             else np.zeros(y.shape[0], dtype=float)
         )
-        X_, y_, y_hat_, inds = self.get_subsample(X, y, y_hat)
+        X_, y_, y_hat_, w_, s_, inds = self.get_subsample(X, y, y_hat)
 
-        s_ = -self.loss_derivative(y_, y_hat_)
         model = self.base_model_class(**self.base_model_params)
         if self.bagging_temperature == 0.0:
-            model.fit(X_, s_)
+            model.fit(X_, s_, sample_weight=w_)
         else:
             w_ = -np.log(np.random.uniform(size=X_.shape[0]))
             if self.bagging_temperature != 1.0:
@@ -98,17 +127,13 @@ class Boosting:
         self.gammas.append(gamma)
         self.train_logits = y_hat + self.learning_rate * gamma * s_hat
 
-    def reset(self):
-        self.models: list = []
-        self.gammas: list = []
-        self.train_logits = None
-
     def fit(
         self,
         X_train,
         y_train,
         X_val=None,
         y_val=None,
+        n_epochs=None,
         plot=False,
     ):
         """
@@ -118,8 +143,9 @@ class Boosting:
         :param y_val: targets array (eval set)
         :param plot: bool
         """
-        self.reset()  # EA?
-        for _ in range(self.n_estimators):
+        if n_epochs is None:
+            n_epochs = self.n_estimators
+        for _ in range(n_epochs):
             self.partial_fit(X_train, y_train)
             self.history["train_roc_auc"].append(
                 roc_auc_score(y_train == 1, self.sigmoid(self.train_logits))
@@ -144,6 +170,7 @@ class Boosting:
                         ]
                     ):
                         break
+        self.n_estimators = len(self.models)
         if plot:
             self.plot_history(X_val, y_val)
 
