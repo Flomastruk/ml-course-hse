@@ -39,6 +39,8 @@ class Boosting:
         subsample: float = 1.0,
         bagging_temperature: Optional[float] = 0.0,
         goss_k: Optional[float] = False,
+        dart: bool = False,
+        dropout_rate: Optional[float] = 0.05,
     ):
         self.base_model_class = base_model_class
         self.base_model_params: dict = (
@@ -53,6 +55,8 @@ class Boosting:
         self.subsample = subsample
         self.bagging_temperature = bagging_temperature
         self.goss_k = goss_k
+        self.dart = dart
+        self.dropout_rate = dropout_rate
 
         self.sigmoid = lambda x: 1 / (1 + np.exp(-x))
         self.loss_fn = lambda y, z: -np.log(self.sigmoid(y * z)).mean()
@@ -62,6 +66,7 @@ class Boosting:
         self.models: list = []
         self.gammas: list = []
 
+        self.cached_predictions: dict = {}
         self.train_logits: Optional[np.ndarray] = None
 
     def get_subsample(self, X, y, y_hat):
@@ -101,13 +106,47 @@ class Boosting:
             s_ = -self.loss_derivative(y_, y_hat_)
             return X[inds], y_, y_hat_, None, s_, inds
 
+    def get_cached_prediction(self, i, X):
+        if i not in self.cached_predictions:
+            self.cached_predictions[i] = self.models[i].predict(X)
+        return self.cached_predictions[i]
+
+    def get_logits(self, X):
+        if 0 == len(self.models):
+            return (
+                np.zeros(X.shape[0], dtype=float),
+                [],
+            )
+        elif not self.dart:
+            return self.train_logits, []
+        else:
+            dropout_models = [
+                i
+                for i, v in enumerate(
+                    np.random.binomial(1, self.dropout_rate, size=len(self.models))
+                )
+                if v
+            ]
+            logits = (
+                np.zeros(X.shape[0], dtype=float)
+                if len(dropout_models) == len(self.models)
+                else (
+                    self.learning_rate
+                    * np.hstack(
+                        [
+                            self.get_cached_prediction(i, X).reshape(-1, 1) * g
+                            for i, g in enumerate(self.gammas)
+                            if i not in dropout_models
+                        ]
+                    )
+                    .sum(axis=1)
+                    .T
+                )
+            )
+            return logits, dropout_models
+
     def partial_fit(self, X, y):
-        # y_hat = self.predict_logit(X)
-        y_hat = (
-            self.train_logits
-            if self.train_logits is not None
-            else np.zeros(y.shape[0], dtype=float)
-        )
+        y_hat, dropout_models = self.get_logits(X)
         X_, y_, y_hat_, w_, s_, inds = self.get_subsample(X, y, y_hat)
 
         model = self.base_model_class(**self.base_model_params)
@@ -122,10 +161,21 @@ class Boosting:
         s_hat = model.predict(X)
         s_hat_ = s_hat if inds is None else s_hat[inds]
 
+        n_dropout_models = len(dropout_models)
         gamma = self.find_optimal_gamma(y_, y_hat_, s_hat_)
-        self.models.append(model)
+        if n_dropout_models > 0:
+            gamma /= self.learning_rate + n_dropout_models
         self.gammas.append(gamma)
-        self.train_logits = y_hat + self.learning_rate * gamma * s_hat
+        self.models.append(model)
+        scale = n_dropout_models / (self.learning_rate + n_dropout_models)
+        for d in dropout_models:
+            self.gammas[d] *= scale
+
+        self.train_logits = (
+            y_hat
+            + (self.train_logits - y_hat) * scale
+            + self.learning_rate * gamma * s_hat
+        )
 
     def fit(
         self,
@@ -135,6 +185,7 @@ class Boosting:
         y_val=None,
         n_epochs=None,
         plot=False,
+        reset_cache=False,
     ):
         """
         :param X_train: features array (train set)
@@ -145,6 +196,26 @@ class Boosting:
         """
         if n_epochs is None:
             n_epochs = self.n_estimators
+
+        if reset_cache:  # if X_train is a new datset, then need to reset
+            self.cached_predictions = {}
+            self.train_logits = (
+                np.zeros(X_train.shape[0], dtype=float)
+                if 0 == len(self.models)
+                else (
+                    self.learning_rate
+                    * np.hstack(
+                        [
+                            self.get_cached_prediction(i, X_train).reshape(-1, 1) * g
+                            for i, g in enumerate(self.gammas)
+                        ]
+                    )
+                    .sum(axis=1)
+                    .T
+                )
+            )
+        if self.train_logits is None:
+            self.train_logits = np.zeros(X_train.shape[0], dtype=float)
         for _ in range(n_epochs):
             self.partial_fit(X_train, y_train)
             self.history["train_roc_auc"].append(
