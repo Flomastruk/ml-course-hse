@@ -11,6 +11,7 @@ import spacy
 from fast_langdetect import detect
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.linear_model import LogisticRegression, SGDClassifier
 from sklearn.model_selection import (
     cross_validate,
@@ -27,7 +28,9 @@ from sklearn.preprocessing import (
     # TargetEncoder,
 )
 from sklearn.svm import LinearSVC
-from sklearn.utils import gen_batches, resample
+
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.utils._testing import ignore_warnings
 
 
 sklearn.set_config(transform_output="polars")
@@ -396,19 +399,50 @@ def _process_chat_df(
     return msgs
 
 
-def process_chat_df(tokenizer: nltk.tokenize.api.TokenizerI = None) -> pl.LazyFrame:
+def get_tokenized_chats(tokenizer_name: str, force_recreate=False) -> pl.DataFrame:
+    """Return tokenized chats, if"""
+    assert tokenizer_name in ("toktok", "nist", "destructor", "tweet")
+
+    import os
+
+    target_path = f"/data/ml-course-hse/ml1-2026-spring/chats_{tokenizer_name}.parquet"
+    if not force_recreate and os.path.exists(target_path):
+        return pl.read_parquet(target_path)
+
     chats = pl.scan_csv(
         f"/data/ml-course-hse/ml1-2026-spring/homework-practice-03-features/game_chat.csv",
         try_parse_dates=True,
     )
-    radiant_chats = _process_chat_df(chats, "radiant_chat", tokenizer=tokenizer).select(
-        pl.col("match_id"), pl.col("normalized_msg").alias("radiant_chat_norm")
-    )
-    dire_chats = _process_chat_df(chats, "dire_chat", tokenizer=tokenizer).select(
-        pl.col("match_id"), pl.col("normalized_msg").alias("dire_chat_norm")
+    match tokenizer_name:
+        case "toktok":
+            tokenizer = nltk.tokenize.ToktokTokenizer()
+        case "nist":
+            from nltk.tokenize.nist import NISTTokenizer
+
+            tokenizer = NISTTokenizer()
+        case "destructor":
+            tokenizer = nltk.tokenize.destructive.NLTKWordTokenizer()
+        case "tweet":
+            tokenizer = nltk.tokenize.casual.TweetTokenizer(
+                reduce_len=True, preserve_case=False
+            )
+
+    msgs = (
+        _process_chat_df(chats, "radiant_chat", tokenizer)
+        .select(pl.col("match_id"), pl.col("normalized_msg").alias("radiant_chat_norm"))
+        .join(
+            _process_chat_df(chats, "dire_chat", tokenizer).select(
+                pl.col("match_id"), pl.col("normalized_msg").alias("dire_chat_norm")
+            ),
+            on="match_id",
+            how="full",
+            coalesce=True,
+        )
     )
 
-    return radiant_chats.join(dire_chats, on="match_id", how="full", coalesce=True)
+    msgs.write_parquet(target_path)
+
+    return msgs
 
 
 def combine_dfs(df: pl.LazyFrame, players: pl.LazyFrame) -> pl.LazyFrame:
@@ -439,35 +473,58 @@ def combine_dfs(df: pl.LazyFrame, players: pl.LazyFrame) -> pl.LazyFrame:
     return df
 
 
-def save_parquet():
-    pass
+### OPTUNA OPTIMIZATIONS
+
+
+def suggest_model_settings(trial: optuna.Trial) -> dict:
+    # model_type = trial.suggest_categorical("model_type", ["logr", "svc"])
+    model_settings = dict(
+        model_type="svc",
+        C=trial.suggest_float("C", 1e-3, 1e3, log=True),
+        max_iter=trial.suggest_int("max_iter", 10, 1000, log=True),
+    )
+    if model_settings["model_type"] == "svc":
+        model_settings["loss"] = trial.suggest_categorical(
+            "loss", ["hinge", "squared_hinge"]
+        )
+        if model_settings["loss"] == "squared_hinge":
+            model_settings["penalty"] = trial.suggest_categorical(
+                "penalty", ("l1", "l2")
+            )
+    else:
+        model_settings["l1_ratio"] = (
+            trial.suggest_float("l1_ratio", 0.0, 1.0, step=0.25),
+        )
+    return model_settings
+
+
+def suggest_chat_vec_settings(trial: optuna.Trial) -> dict:
+    return {
+        "model": trial.suggest_categorical("model", ["tfidf", "counter"]),
+        # "max_df": trial.suggest_float("max_df", 0.5, 1.0),
+        "ngram_range": (1, trial.suggest_int("ngram_max", 1, 2)),
+        "min_df": trial.suggest_int("min_df", 25, 250, step=25),
+        "max_features": trial.suggest_int(
+            "max_features",
+            50,
+            1000,
+            log=True,
+        ),
+    }
 
 
 def gen_objective(X: pl.DataFrame, y: pl.Series):
-    # cols = (
-    #     pl.selectors.starts_with("region_"),
-    #     pl.selectors.starts_with("hero_"),
-    #     "is_weekend",
-    #     "mmr_missing",
-    #     "avg_mmr_log1p",
-    # )
-    # X = df.select(*cols).collect()
-    # y = df.select("radiant_win").collect()["radiant_win"]
+    @ignore_warnings(category=ConvergenceWarning)
     def objective(trial: optuna.Trial) -> float:
-        model_type = trial.suggest_categorical("model_type", ["logr", "svc"])
-
+        model_settings = suggest_model_settings(trial)
+        model_type = model_settings.pop("model_type")
         match model_type:
             case "logr":
-                C = trial.suggest_float("C", 1e-3, 1e6, log=True)
-                max_iter = trial.suggest_int("max_iter", 100, 1000, log=True)
-                model = LogisticRegression(C=C, max_iter=max_iter)
+                model = LogisticRegression(**model_settings)
             case "svc":
-                C = trial.suggest_float("C", 1e-3, 1e6, log=True)
-                max_iter = trial.suggest_int("max_iter", 100, 1000, log=True)
-                loss = trial.suggest_categorical("loss", ["hinge", "squared_hinge"])
-                if loss == "hinge":
-                    max_iter *= 2
-                model = LinearSVC(C=C, max_iter=max_iter, loss=loss)
+                if model_settings["loss"] == "hinge":
+                    model_settings["max_iter"] *= 2
+                model = LinearSVC(**model_settings)
             case _:
                 raise NotImplementedError
 
@@ -496,7 +553,180 @@ def gen_objective(X: pl.DataFrame, y: pl.Series):
 
 # optuna trials with SGDClassifier and stopping criteria
 def gen_objective_sgd(X: pl.DataFrame, y: pl.Series):
+    @ignore_warnings(category=ConvergenceWarning)
     def objective_sgd(trial: optuna.Trial) -> float:
+        n_splits = 4
+        cv_time = TimeSeriesSplit(n_splits=n_splits)
+
+        loss = trial.suggest_categorical("loss", ["log_loss", "squared_hinge", "hinge"])
+        learning_rate = trial.suggest_categorical(
+            "learning_rate", ["optimal", "invscaling"]
+        )
+
+        models = [
+            SGDClassifier(loss=loss, learning_rate=learning_rate, shuffle=False)
+            for _ in range(n_splits)
+        ]
+
+        max_iter = 8
+        n_batches = 1  # make as few batches as possible -- as long as it fits in memory, this speeds up the process
+        step = 0
+        offset = len(next(cv_time.split(X))[0])
+        y_hat = pl.zeros(len(y), dtype=pl.Float64, eager=True)
+        for _ in range(max_iter):
+            train_inds = [
+                sklearn.utils.resample(
+                    tr,
+                    replace=False,
+                    n_samples=len(tr),
+                    random_state=trial.number + 123,
+                )
+                for tr, _ in cv_time.split(X)
+            ]
+            for batches in zip(
+                *(
+                    sklearn.utils.gen_batches(len(tr), -(-len(tr) // n_batches))
+                    for tr in train_inds
+                )
+            ):
+                # # this is actually much slower becase it pickles stuff.. so need to have a proper pipeline or something better.
+                # Xy = zip(*((X[ind := tr[b]], y[ind]) for tr, b in zip(train_inds, batches)))
+                # with ProcessPoolExecutor(max_workers=n_splits) as executor:
+                #     models = list(executor.map(job_func_full, zip(models, *Xy)))
+
+                for model, (X_, y_) in zip(
+                    models,
+                    ((X[ind := tr[b]], y[ind]) for tr, b in zip(train_inds, batches)),
+                ):
+                    model.partial_fit(X_, y_, classes=[False, True])
+
+                for model, (_, ts) in zip(models, cv_time.split(X)):
+                    y_hat[ts] = model.decision_function(X[ts])
+
+                g = gini(y[offset:], y_hat[offset:])
+                print(f"beginning step: {step}, gini: {g}")
+                step += 1
+                trial.report(g, step)
+                if trial.should_prune():
+                    raise optuna.exceptions.TrialPruned()
+        return g
+
+    return objective_sgd
+
+
+def learn_chat_embedding(msgs, settings={}, verbose=False):
+    # this would take care of sparse matrices
+    chat_vec = (
+        TfidfVectorizer if settings.get("model", "") == "tfidf" else CountVectorizer
+    )
+    chat_vec = chat_vec(**{k: v for k, v in settings.items() if k != "model"})
+    chat_vec.fit(
+        pl.concat(
+            [
+                msgs.filter(~pl.col("radiant_chat_norm").is_null()).select(
+                    chat_norm=pl.col("radiant_chat_norm").list.join(separator=" ")
+                ),
+                msgs.filter(~pl.col("dire_chat_norm").is_null()).select(
+                    chat_norm=pl.col("dire_chat_norm").list.join(separator=" ")
+                ),
+            ]
+        )["chat_norm"].to_list()
+    )
+    if verbose:
+        print("Finished training chat model")
+    return chat_vec
+
+
+def adjoin_chat(Xmsg, chat_vec, mode="both"):
+    # this doesn't take advantage of sparce matrices, could be done..
+    radiant = pl.from_numpy(
+        chat_vec.transform(
+            Xmsg.select(
+                pl.col("radiant_chat_norm").list.join(separator=" ").fill_null("")
+            )
+            .to_series()
+            .to_list()
+        ).toarray(),
+        schema=[f"radiant_chat_{x}" for x in chat_vec.get_feature_names_out()],
+    )
+    dire = pl.from_numpy(
+        chat_vec.transform(
+            Xmsg.select(pl.col("dire_chat_norm").list.join(separator=" ").fill_null(""))
+            .to_series()
+            .to_list()
+        ).toarray(),
+        schema=[f"dire_chat_{x}" for x in chat_vec.get_feature_names_out()],
+    )
+
+    if mode == "both":
+        both = pl.from_numpy(
+            radiant.to_numpy() - dire.to_numpy(),
+            schema=[f"chat_{x}" for x in chat_vec.get_feature_names_out()],
+        )
+
+        return pl.concat(
+            [Xmsg.drop("radiant_chat_norm", "dire_chat_norm"), both], how="horizontal"
+        )
+    else:
+        return pl.concat([Xmsg, radiant, dire], how="horizontal")
+
+
+def gen_objective_w_chat(X: pl.DataFrame, y: pl.DataFrame):
+    @ignore_warnings(category=ConvergenceWarning)
+    def objective_w_chat(trial: optuna.Trial) -> float:
+        model_settings = suggest_model_settings(trial)
+        model_type = model_settings.pop("model_type")
+        match model_type:
+            case "logr":
+                model = LogisticRegression(**model_settings)
+            case "svc":
+                if model_settings["loss"] == "hinge":
+                    model_settings["max_iter"] *= 2
+                model = LinearSVC(**model_settings)
+            case _:
+                raise NotImplementedError
+
+        # HERE INNER VS LEFT IS CRITICAL
+        tokenizer_name = trial.suggest_categorical(
+            "tokenizer_name", ("toktok", "nist", "destructor", "tweet")
+        )
+        msgs = get_tokenized_chats(tokenizer_name)
+        X_ = (
+            X.select("match_id")
+            .with_columns(radiant_win=y)
+            .join(msgs, on="match_id", how="inner")
+            .with_columns(
+                pl.col("radiant_chat_norm").fill_null(pl.lit([])),
+                pl.col("dire_chat_norm").fill_null(pl.lit([])),
+            )
+        )
+        y_ = X_.get_column("radiant_win")
+        X_ = X_.drop("radiant_win")
+
+        chat_settings = suggest_chat_vec_settings(trial)
+        chat_vec = learn_chat_embedding(msgs, chat_settings)
+
+        cv_time = TimeSeriesSplit(n_splits=4)
+        y_hat = np.concatenate(
+            [
+                model.fit(
+                    adjoin_chat(X_[tr], chat_vec, mode="both").drop("match_id"),
+                    y_[tr],
+                ).decision_function(
+                    adjoin_chat(X_[ts], chat_vec, mode="both").drop("match_id")
+                )
+                for tr, ts in cv_time.split(X_)
+            ]
+        )
+
+        return gini(y_[-len(y_hat) :], y_hat)
+
+    return objective_w_chat
+
+
+def get_objective_sgd_w_chat(X: pl.DataFrame, y: pl.DataFrame):
+    @ignore_warnings(category=ConvergenceWarning)
+    def objective_sgd_w_chat(trial: optuna.Trial) -> float:
         n_splits = 4
         cv_time = TimeSeriesSplit(n_splits=n_splits)
 
@@ -509,48 +739,74 @@ def gen_objective_sgd(X: pl.DataFrame, y: pl.Series):
             for _ in range(n_splits)
         ]
 
+        # HERE INNER VS LEFT IS CRITICAL
+        tokenizer_name = trial.suggest_categorical(
+            "tokenizer_name", ("toktok", "nist", "destructor", "tweet")
+        )
+        msgs = get_tokenized_chats(tokenizer_name)
+        X_ = (
+            X.select("match_id")
+            .with_columns(radiant_win=y)
+            .join(msgs, on="match_id", how="inner")
+            .with_columns(
+                pl.col("radiant_chat_norm").fill_null(pl.lit([])),
+                pl.col("dire_chat_norm").fill_null(pl.lit([])),
+            )
+        )
+        y_ = X_.get_column("radiant_win")
+        X_ = X_.drop("radiant_win")
+
+        chat_settings = suggest_chat_vec_settings(trial)
+        chat_vec = learn_chat_embedding(msgs, chat_settings)
+
         max_iter = 8
         n_batches = 1  # make as few batches as possible -- as long as it fits in memory, this speeds up the process
         step = 0
+        offset = len(next(cv_time.split(X_))[0])
+        y_hat = pl.zeros(len(y_), dtype=pl.Float64, eager=True)
         for _ in range(max_iter):
             train_inds = [
-                resample(
+                sklearn.utils.resample(
                     tr,
                     replace=False,
                     n_samples=len(tr),
                     random_state=trial.number + 123,
                 )
-                for tr, _ in cv_time.split(X)
+                for tr, _ in cv_time.split(X_)
             ]
             for batches in zip(
-                *(gen_batches(len(tr), -(-len(tr) // n_batches)) for tr in train_inds)
-            ):
-                for model, (X_, y_) in zip(
-                    models,
-                    ((X[ind := tr[b]], y[ind]) for tr, b in zip(train_inds, batches)),
-                ):
-                    model.partial_fit(X_, y_, classes=[False, True])
-
-                # # this is actually much slower becase it pickles stuff.. so need to have a proper pipeline or something better.
-                # Xy = zip(*((X[ind := tr[b]], y[ind]) for tr, b in zip(train_inds, batches)))
-                # with ProcessPoolExecutor(max_workers=n_splits) as executor:
-                #     models = list(executor.map(job_func_full, zip(models, *Xy)))
-
-                g = (
-                    sum(
-                        gini(y[ts], model.decision_function(X[ts]))
-                        for model, (_, ts) in zip(models, cv_time.split(X))
-                    )
-                    / n_splits
+                *(
+                    sklearn.utils.gen_batches(len(tr), -(-len(tr) // n_batches))
+                    for tr in train_inds
                 )
+            ):
+
+                for model, (X_batch, y_batch) in zip(
+                    models,
+                    ((X_[ind := tr[b]], y_[ind]) for tr, b in zip(train_inds, batches)),
+                ):
+
+                    model.partial_fit(
+                        adjoin_chat(X_batch, chat_vec, mode="both").drop("match_id"),
+                        y_batch,
+                        classes=[False, True],
+                    )
+
+                for model, (_, ts) in zip(models, cv_time.split(X_)):
+                    y_hat[ts] = model.decision_function(
+                        adjoin_chat(X_[ts], chat_vec, mode="both").drop("match_id")
+                    )
+
+                g = gini(y_[offset:], y_hat[offset:])
                 print(f"beginning step: {step}, gini: {g}")
                 step += 1
                 trial.report(g, step)
                 if trial.should_prune():
                     raise optuna.exceptions.TrialPruned()
+
         return g
 
-    return objective_sgd
+    return objective_sgd_w_chat
 
 
 class unpack:
@@ -578,3 +834,35 @@ def job_func_full_(model: SGDClassifier, X: pl.DataFrame, y: pl.Series) -> dict:
 
 
 job_func_full = unpack(job_func_full_)
+
+
+if __name__ == "__main__":
+    print("Job started")
+    df_train, _ = process_match_df()
+
+    objective_w_chat = gen_objective_w_chat(
+        df_train.select("match_id", "radiant_win").collect(),
+        df_train.select("radiant_win").collect().to_series(),
+    )
+
+    study_name = "chat_study"
+    storage = f"sqlite:////data/{study_name}.db"
+    sampler = optuna.samplers.TPESampler(seed=10)
+
+    ## if reset
+    try:
+        optuna.delete_study(study_name=study_name, storage=storage)
+    except KeyError:
+        pass  # Study didn't exist yet, which is fine
+
+    study = optuna.create_study(
+        study_name=study_name,
+        sampler=sampler,
+        direction="maximize",
+        pruner=None,
+        storage=storage,
+        load_if_exists=True,
+    )
+    study.optimize(objective_w_chat, show_progress_bar=True, n_trials=20)
+
+    print(study.best_params)
