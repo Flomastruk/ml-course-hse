@@ -26,6 +26,7 @@ from sklearn.preprocessing import (
     OneHotEncoder,
     StandardScaler,
     # TargetEncoder,
+    QuantileTransformer,
 )
 from sklearn.svm import LinearSVC
 
@@ -93,6 +94,44 @@ class HeroesEncoder(BaseEstimator, TransformerMixin):
         cols2 = [f"hero_{i}" for i in range(128, 133)]
         return sum(ohe.fit_transform(X.select(c)) for c in cols1) - sum(
             ohe.fit_transform(X.select(c)) for c in cols2
+        )
+
+
+class ColumnNormalizer(BaseEstimator, TransformerMixin):
+    def __init__(self, cols, group_cols):
+        self.cols = cols
+        self.group_cols = group_cols
+        self.scalers = {}
+        self.quantilers = {}
+
+    def fit(self, X, y=None):
+        for g, gdf in X.select(self.cols + self.group_cols).group_by(self.group_cols):
+            self.scalers[g] = StandardScaler().fit(gdf.select(self.cols))
+            self.quantilers[g] = QuantileTransformer().fit(gdf.select(self.cols))
+
+    def transform(self, X, y=None):
+        def process_group(gdf):
+            g = gdf.select(self.group_cols).row(0)
+            r = pl.concat(
+                [
+                    gdf,
+                    self.scalers[g]
+                    .transform(gdf.select(self.cols))
+                    .select(pl.all().name.suffix("_l2n")),
+                    self.quantilers[g]
+                    .transform(gdf.select(self.cols))
+                    .select(pl.all().name.suffix("_q")),
+                ],
+                how="horizontal",
+            )
+            return r
+
+        return (
+            X.with_row_index("ix")
+            .group_by(self.group_cols)
+            .map_groups(process_group)
+            .sort("ix")
+            .drop("ix")
         )
 
 
@@ -313,7 +352,7 @@ def nlp_preprocess_factory(tokenizer: nltk.tokenize.api.TokenizerI = None):
 
 def _process_chat_df(
     chats: pl.LazyFrame,
-    chat_name: pl.LazyFrame,
+    chat_name: str,
     tokenizer: nltk.tokenize.api.TokenizerI = None,
 ) -> pl.LazyFrame:
     assert chat_name in ("radiant_chat", "dire_chat"), "Unsupported chat"
@@ -351,6 +390,17 @@ def _process_chat_df(
             msg=pl.col(chat_name)
             .str.to_lowercase()
             .str.strip_chars(" ")
+            .str.split("")
+            .list.eval(
+                pl.element().filter(
+                    ~(
+                        (pl.element() == pl.element().shift(1))
+                        & (pl.element() == pl.element().shift(2))
+                        & (pl.element() == pl.element().shift(3))
+                    ).fill_null(False)
+                )
+            )
+            .list.join("")
             .str.replace_all(r"\?{2,}", "?")
             .str.replace_all(r"!{2,}", "!")
             .str.replace_all(r"\.{2,}", ".")
@@ -473,6 +523,186 @@ def combine_dfs(df: pl.LazyFrame, players: pl.LazyFrame) -> pl.LazyFrame:
     return df
 
 
+### parsing advantages
+def clip_cols_std(data, cols, group_cols=pl.lit(1), k=3):
+    return (
+        data.with_columns(
+            pl.col(cols).mean().over(group_cols).name.suffix("_mean"),
+            pl.col(cols).std().over(group_cols).name.suffix("_std"),
+        )
+        .with_columns(
+            pl.col(cols)
+            .clip(
+                pl.col([f"{c}_mean" for c in cols])
+                - k * pl.col([f"{c}_std" for c in cols]),
+                pl.col([f"{c}_mean" for c in cols])
+                + k * pl.col([f"{c}_std" for c in cols]),
+            )
+            .name.suffix("_std_clip")
+        )
+        .drop([f"{c}_mean" for c in cols] + [f"{c}_std" for c in cols])
+    )
+
+
+def clip_cols_mad(data, cols, group_cols=pl.lit(1), k=5):
+    return (
+        data.with_columns(
+            pl.col(cols).median().over(group_cols).name.suffix("_med"),
+            (pl.col(cols) - pl.col(cols).median().over(group_cols))
+            .abs()
+            .median()
+            .over(group_cols)
+            .name.suffix("_mad"),
+        )
+        .with_columns(
+            pl.col(cols)
+            .clip(
+                pl.col([f"{c}_med" for c in cols])
+                - k * pl.col([f"{c}_mad" for c in cols]),
+                pl.col([f"{c}_med" for c in cols])
+                + k * pl.col([f"{c}_mad" for c in cols]),
+            )
+            .name.suffix("_mad_clip")
+        )
+        .drop([f"{c}_med" for c in cols] + [f"{c}_mad" for c in cols])
+    )
+
+
+def get_linreg_stats(data, xcols, ycols, group_cols=pl.lit(1)):
+    beta = [(pl.cov(x, y) / pl.var(x)) for x, y in zip(xcols, ycols)]
+    corr = [(pl.corr(x, y).pow(2)).alias(f"r2_{y}_{x}") for x, y in zip(xcols, ycols)]
+    alpha = [
+        (pl.col(y).mean() - pl.col(x).mean() * b).alias(f"alpha_{y}_{x}")
+        for x, y, b in zip(xcols, ycols, beta)
+    ]
+    return data.group_by(group_cols).agg(
+        [b.alias(f"beta_{y}_{x}") for x, y, b in zip(xcols, ycols, beta)] + corr + alpha
+    )
+
+
+def bin_cols_to_scale(data, cols, nbins):
+    bins = [
+        (
+            (
+                nbins
+                * (pl.col(c) - pl.col(c).min())
+                / (pl.col(c).max() - pl.col(c).min())
+            )
+            // 1
+        )
+        .clip(0, nbins - 1)  # to deal with maximum value
+        .alias(f"{c}_{nbins}bin")
+        for c in cols
+    ]
+    return data.with_columns(bins)
+
+
+def adjoin_adv_stats(X, adv):
+    cols_adv = ("radiant_gold_adv", "radiant_exp_adv")
+    return (
+        X.join(
+            adv.select(
+                ["match_id", "t"]
+                + [f"{c}_std_clip" for c in cols_adv]
+                + [f"{c}_q" for c in cols_adv]
+                + [f"{c}_l2n" for c in cols_adv],
+            )
+            .sort("match_id", "t")
+            .group_by("match_id")
+            .agg(
+                [
+                    pl.selectors.starts_with(c).last().name.suffix("_last")
+                    for c in cols_adv
+                ]
+                + [
+                    pl.selectors.starts_with(c).mean().name.suffix("_avg")
+                    for c in cols_adv
+                ]
+            ),
+            how="left",
+            on="match_id",
+        )
+        .join(  # columns by 5
+            adv.filter(pl.col.t > 0)
+            .group_by(
+                "match_id", gp="t5_" + (5 * ((pl.col.t - 1) // 5)).cast(pl.String)
+            )
+            .agg(
+                pl.col(
+                    [f"{c}_std_clip" for c in cols_adv]
+                    + [f"{c}_l2n" for c in cols_adv]
+                    + [f"{c}_q" for c in cols_adv]
+                ).mean()
+            )
+            .pivot(
+                "gp",
+                on_columns=[f"t5_{5*x}" for x in range(3)],
+                values=[f"{c}_std_clip" for c in cols_adv]
+                + [f"{c}_l2n" for c in cols_adv]
+                + [f"{c}_q" for c in cols_adv],
+                index="match_id",
+            ),
+            how="left",
+            on="match_id",
+        )
+        .join(  # columns by 3
+            adv.filter(pl.col.t > 0)
+            .group_by(
+                "match_id", gp="t3_" + (3 * ((pl.col.t - 1) // 3)).cast(pl.String)
+            )
+            .agg(
+                pl.col(
+                    [f"{c}_std_clip" for c in cols_adv]
+                    + [f"{c}_l2n" for c in cols_adv]
+                    + [f"{c}_q" for c in cols_adv]
+                ).mean()
+            )
+            .pivot(
+                "gp",
+                on_columns=[f"t3_{3*x}" for x in range(5)],
+                values=[f"{c}_std_clip" for c in cols_adv]
+                + [f"{c}_l2n" for c in cols_adv]
+                + [f"{c}_q" for c in cols_adv],
+                index="match_id",
+            ),
+            how="left",
+            on="match_id",
+        )
+        .join(  # linear regression stats
+            get_linreg_stats(
+                adv.filter(pl.col.t > 0).with_columns(
+                    exp_t=pl.col.t.log(), square_t=pl.col.t.pow(2.0)
+                ),
+                ["exp_t" for _ in cols_adv]
+                + ["t" for c in cols_adv]
+                + ["t" for c in cols_adv],
+                [f"{c}_std_clip" for c in cols_adv]
+                + [f"{c}_q" for c in cols_adv]
+                + [f"{c}_l2n" for c in cols_adv],
+                group_cols=["match_id"],
+            ),
+            how="left",
+            on="match_id",
+        )
+        .join(  # linear regression stats on last 5
+            get_linreg_stats(
+                adv.filter(pl.col.t > 9).with_columns(
+                    exp_t=pl.col.t.log(), square_t=pl.col.t.pow(2.0)
+                ),
+                ["exp_t" for _ in cols_adv]
+                + ["t" for c in cols_adv]
+                + ["t" for c in cols_adv],
+                [f"{c}_std_clip" for c in cols_adv]
+                + [f"{c}_q" for c in cols_adv]
+                + [f"{c}_l2n" for c in cols_adv],
+                group_cols=["match_id"],
+            ).select("match_id", pl.selectors.ends_with("_t").name.suffix("_last5")),
+            how="left",
+            on="match_id",
+        )
+    )
+
+
 ### OPTUNA OPTIMIZATIONS
 
 
@@ -517,14 +747,18 @@ def gen_objective(X: pl.DataFrame, y: pl.Series):
     @ignore_warnings(category=ConvergenceWarning)
     def objective(trial: optuna.Trial) -> float:
         model_settings = suggest_model_settings(trial)
-        model_type = model_settings.pop("model_type")
+        model_type = model_settings["model_type"]
         match model_type:
             case "logr":
-                model = LogisticRegression(**model_settings)
+                model = LogisticRegression(
+                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                )
             case "svc":
                 if model_settings["loss"] == "hinge":
                     model_settings["max_iter"] *= 2
-                model = LinearSVC(**model_settings)
+                model = LinearSVC(
+                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                )
             case _:
                 raise NotImplementedError
 
@@ -675,14 +909,18 @@ def gen_objective_w_chat(X: pl.DataFrame, y: pl.DataFrame):
     @ignore_warnings(category=ConvergenceWarning)
     def objective_w_chat(trial: optuna.Trial) -> float:
         model_settings = suggest_model_settings(trial)
-        model_type = model_settings.pop("model_type")
+        model_type = model_settings["model_type"]
         match model_type:
             case "logr":
-                model = LogisticRegression(**model_settings)
+                model = LogisticRegression(
+                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                )
             case "svc":
                 if model_settings["loss"] == "hinge":
                     model_settings["max_iter"] *= 2
-                model = LinearSVC(**model_settings)
+                model = LinearSVC(
+                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                )
             case _:
                 raise NotImplementedError
 
@@ -863,6 +1101,6 @@ if __name__ == "__main__":
         storage=storage,
         load_if_exists=True,
     )
-    study.optimize(objective_w_chat, show_progress_bar=True, n_trials=20)
+    study.optimize(objective_w_chat, show_progress_bar=True, n_trials=100)
 
     print(study.best_params)
