@@ -200,6 +200,7 @@ def _process_match_df(
         "month",
         "weekday",
         "is_weekend",
+        "avg_mmr",
         "avg_mmr_missing",
     ]
     scaled = ["avg_mmr", "avg_mmr_log1p", "avg_mmr_sqrt", "avg_mmr_recip"]
@@ -751,13 +752,13 @@ def gen_objective(X: pl.DataFrame, y: pl.Series):
         match model_type:
             case "logr":
                 model = LogisticRegression(
-                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                    **{k: v for k, v in model_settings.items() if k != "model_type"}
                 )
             case "svc":
                 if model_settings["loss"] == "hinge":
                     model_settings["max_iter"] *= 2
                 model = LinearSVC(
-                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                    **{k: v for k, v in model_settings.items() if k != "model_type"}
                 )
             case _:
                 raise NotImplementedError
@@ -872,7 +873,7 @@ def learn_chat_embedding(msgs, settings={}, verbose=False):
 
 
 def adjoin_chat(Xmsg, chat_vec, mode="both"):
-    # this doesn't take advantage of sparce matrices, could be done..
+    # this doesn't take advantage of sparse matrices, could be done..
     radiant = pl.from_numpy(
         chat_vec.transform(
             Xmsg.select(
@@ -913,13 +914,13 @@ def gen_objective_w_chat(X: pl.DataFrame, y: pl.DataFrame):
         match model_type:
             case "logr":
                 model = LogisticRegression(
-                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                    **{k: v for k, v in model_settings.items() if k != "model_type"}
                 )
             case "svc":
                 if model_settings["loss"] == "hinge":
                     model_settings["max_iter"] *= 2
                 model = LinearSVC(
-                    {k: v for k, v in model_settings.items() if k != "model_type"}
+                    **{k: v for k, v in model_settings.items() if k != "model_type"}
                 )
             case _:
                 raise NotImplementedError
