@@ -8,4 +8,4 @@ COPY pyproject.toml uv.lock ./
 
 # RUN pip install -r reqs/requirements.txt
 # RUN uv pip install --system -r reqs/requirements.txt --no-cache
-RUN uv sync --system --frozen --no-dev
+RUN uv sync --frozen --no-dev
