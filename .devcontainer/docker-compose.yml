@@ -13,5 +13,12 @@ services:
       - ../:/workspace
       # this mirrors volume defined in top-level `volumes` section
       - data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 volumes:
   data:

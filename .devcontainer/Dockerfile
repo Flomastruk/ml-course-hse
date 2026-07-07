@@ -6,7 +6,7 @@ WORKDIR /workspace
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 
 # COPY ../reqs/requirements.txt reqs/
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml ./
 
 ENV UV_PROJECT_ENVIRONMENT=/.venv
 
