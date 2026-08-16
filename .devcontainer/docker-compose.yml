@@ -13,6 +13,8 @@ services:
       - ../:/workspace
       # this mirrors volume defined in top-level `volumes` section
       - data:/data
+      # persists Claude Code memory/settings/credentials across rebuilds
+      - claude-config:/root/.claude
     deploy:
       resources:
         reservations:
@@ -22,3 +24,4 @@ services:
               capabilities: [gpu]
 volumes:
   data:
+  claude-config:
