@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "jupyter": {
+      "type": "http",
+      "url": "http://localhost:1984/mcp",
+      "headers": {
+        "Authorization": "Bearer devcontainer-token"
+      }
+    }
+  }
+}

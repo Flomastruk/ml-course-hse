@@ -1,0 +1,6 @@
+{
+    "id": "npm-group-write",
+    "version": "1.0.0",
+    "name": "Group-writable npm globals",
+    "installsAfter": ["ghcr.io/anthropics/devcontainer-features/claude-code"]
+}

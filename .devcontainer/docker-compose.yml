@@ -14,7 +14,7 @@ services:
       # this mirrors volume defined in top-level `volumes` section
       - data:/data
       # persists Claude Code memory/settings/credentials across rebuilds
-      - claude-config:/root/.claude
+      - claude-config:/home/${USER}/.claude
     deploy:
       resources:
         reservations:

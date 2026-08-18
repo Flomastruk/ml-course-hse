@@ -5,7 +5,9 @@ requires-python = ">=3.12"
 dependencies = [
     "ipython==9.15.0",
     "ipywidgets==8.1.8",
-    "jupyterlab==4.6.1",
+    "jupyterlab==4.6.2",
+    "jupyter-collaboration==5.0.0",
+    "jupyter-mcp-server==1.3.8",
     "kagglehub==1.0.0",
     "librosa==0.11.0",
     "lime==0.2.0.1",
